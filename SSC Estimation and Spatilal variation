@@ -1,0 +1,476 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+import math
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.transform import from_origin
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# ---------------------------------------------------------
+# Load dataset - UPDATED PATH
+# ---------------------------------------------------------
+file = r"D:\Lhasa River\Yangbajing\Randomforest_Yang.xlsx"
+print(f"Loading data from: {file}")
+df = pd.read_excel(file)
+print(f"Data loaded. Shape: {df.shape}")
+
+# ---------------------------------------------------------
+# Predictor columns
+# ---------------------------------------------------------
+bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+band_order = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+
+# ---------------------------------------------------------
+# Select rows with observed SSC
+# ---------------------------------------------------------
+df_obs = df.dropna(subset=["SSC"]).copy()
+X = df_obs[bands]
+y = df_obs["SSC"]
+print(f"\nData with SSC observations: {df_obs.shape[0]} samples")
+print(f"Band ranges:")
+for band in bands:
+    print(f"  {band}: {df_obs[band].min():.4f} to {df_obs[band].max():.4f}")
+
+# ---------------------------------------------------------
+# Split data: 70% training, 30% validation
+# ---------------------------------------------------------
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.3, random_state=42
+)
+print(f"\nTraining samples: {X_train.shape[0]}")
+print(f"Validation samples: {X_val.shape[0]}")
+
+# ---------------------------------------------------------
+# Train Random Forest
+# ---------------------------------------------------------
+print("\nTraining Random Forest model...")
+model = RandomForestRegressor(n_estimators=1000, random_state=42)
+model.fit(X_train, y_train)
+print("Model training complete!")
+
+# ---------------------------------------------------------
+# Predict on training set (DATE INCLUDED)
+# ---------------------------------------------------------
+y_train_pred = model.predict(X_train)
+
+df_train = X_train.copy()
+df_train["Date"] = df_obs.loc[X_train.index, "Date"].values
+df_train["SSC_Observed"] = y_train.values
+df_train["SSC_Predicted"] = y_train_pred
+df_train["Error"] = y_train.values - y_train_pred
+
+# ---------------------------------------------------------
+# Predict on validation set (DATE INCLUDED)
+# ---------------------------------------------------------
+y_val_pred = model.predict(X_val)
+
+df_val = X_val.copy()
+df_val["Date"] = df_obs.loc[X_val.index, "Date"].values
+df_val["SSC_Observed"] = y_val.values
+df_val["SSC_Predicted"] = y_val_pred
+df_val["Error"] = y_val.values - y_val_pred
+
+# ---------------------------------------------------------
+# Model performance metrics
+# ---------------------------------------------------------
+def metrics(y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    rmse = math.sqrt(mean_squared_error(y_true, y_pred))
+    nse = 1 - sum((y_true - y_pred)**2) / sum((y_true - np.mean(y_true))**2)
+    pbias = 100 * sum(y_pred - y_true) / sum(y_true)
+    return r2, rmse, nse, pbias
+
+r2_train, rmse_train, nse_train, pbias_train = metrics(y_train, y_train_pred)
+r2_val, rmse_val, nse_val, pbias_val = metrics(y_val, y_val_pred)
+
+summary = pd.DataFrame({
+    "Dataset": ["Training", "Validation"],
+    "R2": [r2_train, r2_val],
+    "RMSE": [rmse_train, rmse_val],
+    "NSE": [nse_train, nse_val],
+    "PBIAS": [pbias_train, pbias_val]
+})
+
+print("\n" + "="*60)
+print("MODEL PERFORMANCE")
+print("="*60)
+print(f"Training R²: {r2_train:.4f}, RMSE: {rmse_train:.2f}, NSE: {nse_train:.4f}, PBIAS: {pbias_train:.2f}%")
+print(f"Validation R²: {r2_val:.4f}, RMSE: {rmse_val:.2f}, NSE: {nse_val:.4f}, PBIAS: {pbias_val:.2f}%")
+
+# ---------------------------------------------------------
+# Predict SSC for all dates in Excel
+# ---------------------------------------------------------
+df["SSC_Predicted"] = model.predict(df[bands])
+
+# ---------------------------------------------------------
+# Feature importance
+# ---------------------------------------------------------
+fi = pd.DataFrame({
+    "Band": bands,
+    "Importance": model.feature_importances_
+}).sort_values("Importance", ascending=False)
+
+print("\n" + "="*60)
+print("FEATURE IMPORTANCE")
+print("="*60)
+for idx, row in fi.iterrows():
+    print(f"{row['Band']}: {row['Importance']:.4f}")
+
+# ---------------------------------------------------------
+# FUNCTION TO CREATE SPATIAL SSC MAP FROM LANDSAT IMAGES
+# ---------------------------------------------------------
+def create_ssc_map_from_tifs_simple(tif_folder_path, output_path, model, band_order):
+    """
+    Simplified version for specific band naming: Blue.tif, Green.tif, Red.tif, etc.
+    """
+    
+    print(f"\n{'='*60}")
+    print(f"Processing folder: {tif_folder_path}")
+    print(f"{'='*60}")
+    
+    # Check if folder exists
+    if not os.path.exists(tif_folder_path):
+        print(f"ERROR: Folder does not exist: {tif_folder_path}")
+        return None
+    
+    # Check for expected files
+    expected_files = ["Blue.tif", "Green.tif", "Red.tif", "NIR.tif", "SWIR1.tif", "SWIR2.tif"]
+    band_files = {}
+    
+    print("Looking for band files...")
+    for band in band_order:
+        expected_file = f"{band}.tif"
+        file_path = os.path.join(tif_folder_path, expected_file)
+        
+        # Check with .tif extension
+        if os.path.exists(file_path):
+            band_files[band] = file_path
+            print(f"  ✓ Found {expected_file}")
+        else:
+            # Check with .TIF (uppercase) extension
+            alt_path = os.path.join(tif_folder_path, f"{band}.TIF")
+            if os.path.exists(alt_path):
+                band_files[band] = alt_path
+                print(f"  ✓ Found {band}.TIF")
+            else:
+                # List what's actually in the folder
+                print(f"  ✗ Missing: {expected_file}")
+                # Show similar files
+                actual_files = [f for f in os.listdir(tif_folder_path) if band.lower() in f.lower()]
+                if actual_files:
+                    print(f"    Similar files found: {actual_files}")
+    
+    # Check if all bands found
+    missing_bands = [band for band in band_order if band not in band_files]
+    if missing_bands:
+        print(f"\nERROR: Missing bands: {missing_bands}")
+        print("\nFiles in folder:")
+        all_files = os.listdir(tif_folder_path)
+        for f in sorted(all_files):
+            if f.lower().endswith(('.tif', '.tiff')):
+                print(f"  - {f}")
+        return None
+    
+    # Read and stack bands
+    band_data = []
+    transform = None
+    crs = None
+    profile = None
+    
+    print("\nReading band data...")
+    for band in tqdm(band_order, desc="Reading bands"):
+        try:
+            with rasterio.open(band_files[band]) as src:
+                data = src.read(1).astype(np.float32)
+                
+                # Handle no data values
+                if src.nodata is not None:
+                    data[data == src.nodata] = np.nan
+                
+                band_data.append(data)
+                
+                if transform is None:
+                    transform = src.transform
+                    crs = src.crs
+                    profile = src.profile.copy()
+                    print(f"  Image dimensions: {data.shape}")
+                    print(f"  CRS: {crs}")
+                
+        except Exception as e:
+            print(f"ERROR reading {band}: {e}")
+            return None
+    
+    # Stack bands
+    print("\nStacking bands...")
+    try:
+        stacked = np.stack(band_data, axis=-1)  # Shape: (height, width, bands)
+        height, width, num_bands = stacked.shape
+        print(f"Stacked shape: {height} x {width} x {num_bands}")
+        print(f"Total pixels: {height * width:,}")
+    except Exception as e:
+        print(f"ERROR stacking bands: {e}")
+        return None
+    
+    # Reshape for prediction
+    print("\nPreparing data for prediction...")
+    X_spatial = stacked.reshape(-1, num_bands)
+    
+    # Check for NaN values
+    valid_mask = ~np.any(np.isnan(X_spatial), axis=1)
+    X_valid = X_spatial[valid_mask]
+    
+    print(f"Valid pixels (no NaN): {len(X_valid):,}")
+    print(f"Invalid pixels (with NaN): {len(X_spatial) - len(X_valid):,}")
+    print(f"Percentage valid: {100 * len(X_valid) / len(X_spatial):.2f}%")
+    
+    if len(X_valid) == 0:
+        print("ERROR: No valid pixels found!")
+        return None
+    
+    # Predict SSC
+    print("\nPredicting SSC values...")
+    try:
+        # Predict in chunks to manage memory
+        chunk_size = 100000
+        predictions = []
+        
+        for i in tqdm(range(0, len(X_valid), chunk_size), desc="Predicting"):
+            chunk = X_valid[i:i + chunk_size]
+            chunk_pred = model.predict(chunk)
+            predictions.append(chunk_pred)
+        
+        ssc_predictions_valid = np.concatenate(predictions)
+        
+        # Create full array
+        ssc_predictions = np.full(X_spatial.shape[0], np.nan, dtype=np.float32)
+        ssc_predictions[valid_mask] = ssc_predictions_valid
+        
+        # Reshape back
+        ssc_map = ssc_predictions.reshape(height, width)
+        
+        # Statistics
+        valid_ssc = ssc_predictions_valid
+        print(f"\nSSC Statistics:")
+        print(f"  Min:    {np.min(valid_ssc):.2f} mg/L")
+        print(f"  Max:    {np.max(valid_ssc):.2f} mg/L")
+        print(f"  Mean:   {np.mean(valid_ssc):.2f} mg/L")
+        print(f"  Std:    {np.std(valid_ssc):.2f} mg/L")
+        print(f"  Median: {np.median(valid_ssc):.2f} mg/L")
+        
+        # Percentiles
+        percentiles = [5, 25, 50, 75, 95]
+        perc_values = np.percentile(valid_ssc, percentiles)
+        for p, v in zip(percentiles, perc_values):
+            print(f"  P{p:02d}:   {v:.2f} mg/L")
+        
+    except Exception as e:
+        print(f"ERROR during prediction: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+    # Save SSC map
+    print(f"\nSaving SSC map to: {output_path}")
+    try:
+        # Create output directory if needed
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Update profile
+        profile.update({
+            'driver': 'GTiff',
+            'dtype': rasterio.float32,
+            'count': 1,
+            'compress': 'lzw',
+            'nodata': np.nan,
+            'height': height,
+            'width': width,
+            'transform': transform,
+            'crs': crs
+        })
+        
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            dst.write(ssc_map, 1)
+            dst.set_band_description(1, "SSC_Predicted_mg_per_L")
+        
+        print(f"✓ SSC map saved successfully!")
+        print(f"  Size: {height} x {width} pixels")
+        print(f"  Resolution: {transform.a:.2f} m")
+        
+        return ssc_map, transform, crs
+        
+    except Exception as e:
+        print(f"ERROR saving SSC map: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ---------------------------------------------------------
+# CREATE SSC MAP FOR SPECIFIC DATE
+# ---------------------------------------------------------
+print("\n" + "="*60)
+print("CREATING SSC MAP")
+print("="*60)
+
+# Define paths - MODIFY THESE AS NEEDED
+tif_folder = r"E:\Landsat_YB\March-20170313"
+output_ssc_map = r"E:\Landsat_YB\March-20170313\SSC_Map.tif"
+
+print(f"Input folder: {tif_folder}")
+print(f"Output file: {output_ssc_map}")
+
+# Ask for confirmation
+create_map = input("\nCreate SSC map? (y/n): ").lower()
+if create_map == 'y':
+    # Create SSC map
+    result = create_ssc_map_from_tifs_simple(
+        tif_folder_path=tif_folder,
+        output_path=output_ssc_map,
+        model=model,
+        band_order=band_order
+    )
+    
+    if result is None:
+        print("\n✗ Failed to create SSC map")
+    else:
+        ssc_map, transform, crs = result
+        print("\n" + "="*60)
+        print("✓ SSC MAP CREATION SUCCESSFUL!")
+        print("="*60)
+        
+        # Option to create visualization
+        create_viz = input("\nCreate visualization? (y/n): ").lower()
+        if create_viz == 'y':
+            try:
+                import matplotlib.pyplot as plt
+                from matplotlib.colors import LogNorm, Normalize
+                
+                print("Creating visualization...")
+                
+                # Create figure with subplots
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+                
+                # Main map
+                valid_mask = ~np.isnan(ssc_map)
+                ssc_valid = ssc_map[valid_mask]
+                
+                # Use log scale for SSC (common for sediment)
+                vmin = max(0.1, np.percentile(ssc_valid, 2))
+                vmax = np.percentile(ssc_valid, 98)
+                
+                im1 = ax1.imshow(ssc_map, cmap='jet', 
+                                norm=LogNorm(vmin=vmin, vmax=vmax),
+                                interpolation='nearest')
+                
+                ax1.set_title('Suspended Sediment Concentration (SSC)\n2014-01-29', 
+                             fontsize=14, fontweight='bold')
+                ax1.axis('off')
+                
+                # Add colorbar
+                cbar = plt.colorbar(im1, ax=ax1, shrink=0.8)
+                cbar.set_label('SSC (mg/L)', fontsize=12)
+                
+                # Histogram
+                ax2.hist(ssc_valid, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+                ax2.set_xlabel('SSC (mg/L)', fontsize=12)
+                ax2.set_ylabel('Frequency', fontsize=12)
+                ax2.set_title('SSC Distribution', fontsize=14, fontweight='bold')
+                ax2.grid(True, alpha=0.3)
+                
+                # Add statistics to histogram
+                stats_text = f"""Statistics:
+Mean: {np.mean(ssc_valid):.1f} mg/L
+Std: {np.std(ssc_valid):.1f} mg/L
+Min: {np.min(ssc_valid):.1f} mg/L
+Max: {np.max(ssc_valid):.1f} mg/L
+Median: {np.median(ssc_valid):.1f} mg/L
+N pixels: {len(ssc_valid):,}"""
+                
+                ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes,
+                        fontsize=10, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+                
+                plt.tight_layout()
+                
+                # Save visualization
+                viz_path = r"D:\Upper Yellow River\Tang Naihai\SSC_Maps\SSC_Map_20140129_visualization.png"
+                plt.savefig(viz_path, dpi=300, bbox_inches='tight', facecolor='white')
+                print(f"✓ Visualization saved to: {viz_path}")
+                plt.show()
+                
+            except Exception as e:
+                print(f"Could not create visualization: {e}")
+else:
+    print("Skipping SSC map creation")
+
+# ---------------------------------------------------------
+# EXPORT EXCEL REPORT
+# ---------------------------------------------------------
+print("\n" + "="*60)
+print("EXPORTING EXCEL REPORT")
+print("="*60)
+
+output_file = r"D:\Lhasa River\Yangbajing\RandomForest_Report_YB.xlsx"
+print(f"Exporting report to: {output_file}")
+
+try:
+    with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+        # Model performance
+        summary.to_excel(writer, sheet_name="Model_Performance", index=False)
+        
+        # Training data
+        df_train.to_excel(writer, sheet_name="Training_Data", index=False)
+        
+        # Validation data
+        df_val.to_excel(writer, sheet_name="Validation_Data", index=False)
+        
+        # All predictions
+        df.to_excel(writer, sheet_name="All_Predictions", index=False)
+        
+        # Feature importance
+        fi.to_excel(writer, sheet_name="Feature_Importance", index=False)
+        
+        # Model info
+        model_info = pd.DataFrame({
+            'Parameter': ['n_estimators', 'random_state', 'Test Size', 'Model Type', 
+                         'SSC_Map_Created', 'Input Folder', 'Output Map'],
+            'Value': [1000, 42, '30%', 'RandomForestRegressor',
+                     'Yes' if 'result' in locals() and result is not None else 'No',
+                     tif_folder, output_ssc_map if 'output_ssc_map' in locals() else 'N/A']
+        })
+        model_info.to_excel(writer, sheet_name="Model_Info", index=False)
+        
+        # Band statistics
+        band_stats = []
+        for band in bands:
+            band_stats.append({
+                'Band': band,
+                'Min_Train': X_train[band].min(),
+                'Max_Train': X_train[band].max(),
+                'Mean_Train': X_train[band].mean(),
+                'Min_Val': X_val[band].min(),
+                'Max_Val': X_val[band].max(),
+                'Mean_Val': X_val[band].mean()
+            })
+        band_stats_df = pd.DataFrame(band_stats)
+        band_stats_df.to_excel(writer, sheet_name="Band_Statistics", index=False)
+    
+    print(f"✓ Report saved successfully: {output_file}")
+    
+except Exception as e:
+    print(f"✗ Error saving report: {e}")
+
+print("\n" + "="*60)
+print("PROCESS COMPLETED")
+print("="*60)
+print(f"Model R² (Validation): {r2_val:.4f}")
+print(f"Feature importance top: {fi.iloc[0]['Band']} ({fi.iloc[0]['Importance']:.4f})")
+
+if 'result' in locals() and result is not None:
+    print(f"SSC map created: {output_ssc_map}")
+    print(f"Excel report: {output_file}")
