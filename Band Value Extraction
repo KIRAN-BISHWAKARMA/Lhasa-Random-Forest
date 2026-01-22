@@ -1,0 +1,59 @@
+import os
+import rasterio
+import geopandas as gpd
+import pandas as pd
+from rasterio.mask import mask
+
+# === SET YOUR PATHS ===
+landsat_root = r'D:\Lhasa River\Landsat\137039'
+shapefile_folder = r'D:\Lhasa River\Lhasa\Lhasa New Working File\New_Shape'
+target_bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
+
+# === LOAD SHAPEFILE ===
+shapefile_path = os.path.join(
+    shapefile_folder,
+    [f for f in os.listdir(shapefile_folder) if f.endswith('.shp')][0]
+)
+shape = gpd.read_file(shapefile_path)
+
+# === LOOP THROUGH ALL SUBFOLDERS IN LANDSAT ROOT ===
+for folder in os.listdir(landsat_root):
+    folder_path = os.path.join(landsat_root, folder)
+    if not os.path.isdir(folder_path):
+        continue  # skip if not a folder
+    
+    print(f"\n📂 Processing folder: {folder_path}")
+    results = {}
+    
+    # === LOOP OVER EACH BAND TO EXTRACT VALUES ===
+    for band in target_bands:
+        matched_file = [f for f in os.listdir(folder_path) if band in f and f.endswith('.TIF')]
+        if not matched_file:
+            print(f"⚠️ File for {band} not found in {folder}.")
+            continue
+
+        file_path = os.path.join(folder_path, matched_file[0])
+        with rasterio.open(file_path) as src:
+            # Ensure shapefile CRS matches raster CRS
+            shape_proj = shape.to_crs(src.crs)
+            
+            try:
+                # Mask raster with shapefile
+                masked_image, _ = mask(src, shape_proj.geometry, crop=True)
+                masked_data = masked_image[0].flatten()
+                masked_data = masked_data[masked_data != src.nodata]  # remove no-data values
+                results[band] = masked_data
+            except ValueError:
+                print(f"⏭️ Skipping {band} in {folder} (no overlap with shapefile).")
+                continue
+    
+    # === COMBINE INTO SINGLE DATAFRAME ===
+    if results:  # only if some bands were extracted
+        df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in results.items()]))
+
+        # === EXPORT TO EXCEL (inside each folder) ===
+        excel_path = os.path.join(folder_path, 'BandValue_Lhasa.xlsx')
+        df.to_excel(excel_path, index=False)
+        print(f"✅ Pixel values saved to: {excel_path}")
+    else:
+        print(f"❌ No band data extracted for folder: {folder}")
