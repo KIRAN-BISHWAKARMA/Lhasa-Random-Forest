@@ -1,0 +1,106 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+import math
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------
+# Load dataset
+# ---------------------------------------------------------
+file = r"D:\Lhasa River\Combine\Lhasa_RandomForest_Combine.xlsx"
+df = pd.read_excel(file)
+
+# ---------------------------------------------------------
+# Predictor columns
+# ---------------------------------------------------------
+bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+
+# ---------------------------------------------------------
+# Select rows with observed SSC
+# ---------------------------------------------------------
+df_obs = df.dropna(subset=["SSC"]).copy()
+X = df_obs[bands]
+y = df_obs["SSC"]
+
+# ---------------------------------------------------------
+# Split data: 80% training, 20% validation
+# ---------------------------------------------------------
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# ---------------------------------------------------------
+# Train Random Forest
+# ---------------------------------------------------------
+model = RandomForestRegressor(n_estimators=1000, random_state=42)
+model.fit(X_train, y_train)
+
+# ---------------------------------------------------------
+# Predict on training set (DATE INCLUDED)
+# ---------------------------------------------------------
+y_train_pred = model.predict(X_train)
+
+df_train = X_train.copy()
+df_train["SSC_Observed"] = y_train.values
+df_train["SSC_Predicted"] = y_train_pred
+df_train["Error"] = y_train.values - y_train_pred
+
+# ---------------------------------------------------------
+# Predict on validation set (DATE INCLUDED)
+# ---------------------------------------------------------
+y_val_pred = model.predict(X_val)
+
+df_val = X_val.copy()
+df_val["SSC_Observed"] = y_val.values
+df_val["SSC_Predicted"] = y_val_pred
+df_val["Error"] = y_val.values - y_val_pred
+
+# ---------------------------------------------------------
+# Model performance metrics
+# ---------------------------------------------------------
+def metrics(y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    rmse = math.sqrt(mean_squared_error(y_true, y_pred))
+    nse = 1 - sum((y_true - y_pred)**2) / sum((y_true - np.mean(y_true))**2)
+    pbias = 100 * sum(y_pred - y_true) / sum(y_true)
+    return r2, rmse, nse, pbias
+
+r2_train, rmse_train, nse_train, pbias_train = metrics(y_train, y_train_pred)
+r2_val, rmse_val, nse_val, pbias_val = metrics(y_val, y_val_pred)
+
+summary = pd.DataFrame({
+    "Dataset": ["Training", "Validation"],
+    "R2": [r2_train, r2_val],
+    "RMSE": [rmse_train, rmse_val],
+    "NSE": [nse_train, nse_val],
+    "PBIAS": [pbias_train, pbias_val]
+})
+
+# ---------------------------------------------------------
+# Predict SSC for all dates
+# ---------------------------------------------------------
+df["SSC_Predicted"] = model.predict(df[bands])
+
+# ---------------------------------------------------------
+# Feature importance
+# ---------------------------------------------------------
+fi = pd.DataFrame({
+    "Band": bands,
+    "Importance": model.feature_importances_
+}).sort_values("Importance", ascending=False)
+
+# ---------------------------------------------------------
+# EXPORT EXCEL REPORT
+# ---------------------------------------------------------
+output_file = r"D:\Lhasa River\Combine\RandomForest_Full_Report_Combine_2026.xlsx"
+
+with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+    summary.to_excel(writer, sheet_name="Model_Performance", index=False)
+    df_train.to_excel(writer, sheet_name="Training_Data", index=False)
+    df_val.to_excel(writer, sheet_name="Validation_Data", index=False)
+    df.to_excel(writer, sheet_name="All_Predictions", index=False)
+    fi.to_excel(writer, sheet_name="Feature_Importance", index=False)
+
+print("Report saved at:", output_file)
