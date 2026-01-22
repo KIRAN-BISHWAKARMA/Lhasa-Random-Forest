@@ -1,0 +1,145 @@
+
+# ===================================================================
+# File: D:/Lasha River/Combine/Polynomial_SSC_Reg2_Improved_Map.py
+# Purpose: Polynomial Regression + SSC Estimation for New Dates
+# ===================================================================
+
+import pandas as pd
+import itertools
+import numpy as np
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+
+# -----------------------------
+# Load Training Dataset
+# -----------------------------
+file = r"D:\Lhasa River\Combine\Lhasa_Regression_Combine.xlsx"
+df = pd.read_excel(file)
+
+bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+ssc = "SSC"
+degree = 1
+
+results = []
+
+# -----------------------------
+# SAFE DIVISION
+# -----------------------------
+def safe_ratio(a, b):
+    return np.divide(a, b + 1e-6)
+
+# -----------------------------
+# SCIENTIFIC NOTATION FORMAT
+# -----------------------------
+def sci_notation(x, precision=3):
+    if x == 0:
+        return "0"
+    exp = int(np.floor(np.log10(abs(x))))
+    coef = x / (10 ** exp)
+    return f"{coef:.{precision}f}×10^{exp}"
+
+# ------------------------------------------------------
+# FEATURE ENGINEERING + MODEL SEARCH
+# ------------------------------------------------------
+for r in [1, 2, 3, 4, 5, 6]:
+    for comb in itertools.combinations(bands, r):
+
+        X_list = []
+        feature_names = []
+
+        for band in comb:
+            X_list.append(df[band])
+            feature_names.append(band)
+
+        if len(comb) > 1:
+            mul = np.ones(len(df))
+            mul_name = ""
+            for band in comb:
+                mul *= df[band]
+                mul_name += band + "*"
+            mul_name = mul_name[:-1]
+            X_list.append(mul)
+            feature_names.append(mul_name)
+
+        if len(comb) == 2:
+            X_list.append(safe_ratio(df[comb[0]], df[comb[1]]))
+            X_list.append(safe_ratio(df[comb[1]], df[comb[0]]))
+            feature_names.extend([f"{comb[0]}/{comb[1]}", f"{comb[1]}/{comb[0]}"])
+
+        X_array = np.column_stack(X_list)
+
+        poly = PolynomialFeatures(degree=degree, include_bias=False)
+        X_poly = poly.fit_transform(X_array)
+
+        model = LinearRegression()
+        model.fit(X_poly, df[ssc])
+
+        pred = np.maximum(model.predict(X_poly), 0)
+        r2 = r2_score(df[ssc], pred)
+
+        results.append((comb, r2, model, feature_names))
+
+# ------------------------------------------------------
+# SELECT BEST MODEL
+# ------------------------------------------------------
+best_comb, best_r2, best_model, base_features = sorted(
+    results, key=lambda x: x[1], reverse=True
+)[0]
+
+poly = PolynomialFeatures(degree=degree, include_bias=False)
+
+# ======================================================
+# APPLY SSC EQUATION TO NEW EXCEL FILE
+# ======================================================
+new_file = r"D:\Lhasa River\Yangbajing\Regression_Yang.xlsx"
+df_new = pd.read_excel(new_file)
+
+X_new_list = []
+
+# Rebuild features EXACTLY as training
+for band in best_comb:
+    X_new_list.append(df_new[band])
+
+if len(best_comb) > 1:
+    mul = np.ones(len(df_new))
+    for band in best_comb:
+        mul *= df_new[band]
+    X_new_list.append(mul)
+
+if len(best_comb) == 2:
+    X_new_list.append(safe_ratio(df_new[best_comb[0]], df_new[best_comb[1]]))
+    X_new_list.append(safe_ratio(df_new[best_comb[1]], df_new[best_comb[0]]))
+
+X_new = np.column_stack(X_new_list)
+X_new_poly = poly.fit_transform(X_new)
+
+# Predict SSC
+ssc_estimated = np.maximum(best_model.predict(X_new_poly), 0)
+df_new["SSC_Estimated"] = ssc_estimated
+
+# ------------------------------------------------------
+# EXPORT NEW SSC RESULTS
+# ------------------------------------------------------
+output_new = r"D:\Lhasa River\Yangbajing\Estimated_SSC_Output_YB.xlsx"
+df_new.to_excel(output_new, index=False)
+
+# ------------------------------------------------------
+# PRINT SSC EQUATION (POWER FORM)
+# ------------------------------------------------------
+print("\n===============================")
+print(" SSC REGRESSION EQUATION (POWER FORM)")
+print("===============================")
+
+equation = f"SSC = {sci_notation(best_model.intercept_)} "
+for coef, name in zip(best_model.coef_, poly.get_feature_names_out()):
+    sign = "+" if coef >= 0 else "-"
+    equation += f"{sign} ({sci_notation(abs(coef))})*{name} "
+
+print(equation)
+print("\nR² =", round(best_r2, 4))
+print("Bands Used:", best_comb)
+print("=================================\n")
+
+print("✔ SSC estimation for new dates completed")
+print("✔ Output saved to:", output_new)
